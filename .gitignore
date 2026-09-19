@@ -37,5 +37,5 @@ Thumbs.db
 *.log
 tmp/
 temp/
-
-.air.*
+/tmp/
+.air*
