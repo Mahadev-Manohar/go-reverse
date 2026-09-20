@@ -1,18 +1,22 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"net/http"
 )
 
-func hello(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintln(w, "Hello from the backend!")
-}
-
 func main() {
-	http.HandleFunc("/hello", hello)
+	port := flag.String("port", "9001", "backend port")
+	name := flag.String("name", "backend-1", "backend name")
 
-	fmt.Println("Backend running on :9000")
+	flag.Parse()
 
-	http.ListenAndServe(":9000", nil)
+	http.HandleFunc("/hello", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "Hello from %s\n", *name)
+	})
+
+	fmt.Printf("%s running on :%s\n", *name, *port)
+
+	http.ListenAndServe(":"+*port, nil)
 }
