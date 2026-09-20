@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 )
 
 type Backend struct {
@@ -14,11 +15,14 @@ type Backend struct {
 type BackendPool struct {
 	backends []Backend
 	current  int
+	mu	   sync.Mutex
 }
 
 func (p *BackendPool) Next() Backend {
-	backend := p.backends[p.current]
+	p.mu.Lock()
+    defer p.mu.Unlock()
 
+	backend := p.backends[p.current]
 	p.current = (p.current + 1) % len(p.backends)
 
 	return backend
