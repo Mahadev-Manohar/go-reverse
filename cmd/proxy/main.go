@@ -5,11 +5,14 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"time"
+	"errors"
 )
 
 type Backend struct {
 	URL  string
 	Name string
+	Healthy bool
 }
 
 type BackendPool struct {
@@ -18,20 +21,54 @@ type BackendPool struct {
 	mu	   sync.Mutex
 }
 
-func (p *BackendPool) Next() Backend {
+func (p *BackendPool) Next() (Backend, error) {
 	p.mu.Lock()
-    defer p.mu.Unlock()
+	defer p.mu.Unlock()
 
-	backend := p.backends[p.current]
-	p.current = (p.current + 1) % len(p.backends)
+	for i := 0; i < len(p.backends); i++ {
+		backend := p.backends[p.current]
 
-	return backend
+		p.current = (p.current + 1) % len(p.backends)
+
+		if backend.Healthy {
+			return backend, nil
+		}
+	}
+
+	return Backend{}, errors.New("no healthy backends available")
+}
+
+func (p *BackendPool) HealthCheck() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	client := &http.Client{
+		Timeout: 2 * time.Second,
+	}
+
+	for i := range p.backends {
+		resp, err := client.Get(p.backends[i].URL + "/hello")
+
+		if err != nil {
+			p.backends[i].Healthy = false
+			continue
+		}
+
+		resp.Body.Close()
+
+		p.backends[i].Healthy = resp.StatusCode >= 200 &&
+			resp.StatusCode < 300
+	}
 }
 
 func proxyHandler(pool *BackendPool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 
-		backend := pool.Next()
+		backend, err := pool.Next()
+		if err != nil {
+			http.Error(w, "No healthy backends available", http.StatusServiceUnavailable)
+			return
+		}
 
 		targetURL := backend.URL + r.URL.RequestURI()
 
@@ -79,6 +116,15 @@ func proxyHandler(pool *BackendPool) http.HandlerFunc {
 	}
 }
 
+func (p *BackendPool) StartHealthChecker() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		p.HealthCheck()
+	}
+}
+
 func main() {
 
 	pool := &BackendPool{
@@ -86,21 +132,24 @@ func main() {
 			{
 				URL:  "http://localhost:9001",
 				Name: "backend-1",
+				Healthy: true,
 			},
 			{
 				URL:  "http://localhost:9002",
 				Name: "backend-2",
+				Healthy: true,	
 			},
 			{
 				URL:  "http://localhost:9003",
 				Name: "backend-3",
+				Healthy: true,
 			},
 		},
 	}
 
+	go pool.StartHealthChecker()
+
 	http.HandleFunc("/", proxyHandler(pool))
-
 	fmt.Println("Proxy running on :8080")
-
 	http.ListenAndServe(":8080", nil)
 }
