@@ -112,6 +112,13 @@ func (p *BackendPool) StartHealthChecker() {
 	}
 }
 
+func (p *BackendPool) Size() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return len(p.backends)
+}
+
 func proxyHandler(pool *BackendPool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 
@@ -126,7 +133,7 @@ func proxyHandler(pool *BackendPool) http.HandlerFunc {
 			Timeout: 5 * time.Second,
 		}
 
-		maxAttempts := 2
+		maxAttempts := pool.Size()
 
 		for attempt := 0; attempt < maxAttempts; attempt++ {
 
@@ -149,17 +156,14 @@ func proxyHandler(pool *BackendPool) http.HandlerFunc {
 			if err == nil {
 				defer resp.Body.Close()
 
-				// Forward response headers
 				for key, values := range resp.Header {
 					for _, value := range values {
 						w.Header().Add(key, value)
 					}
 				}
 
-				// Forward status code
 				w.WriteHeader(resp.StatusCode)
 
-				// Forward response body
 				io.Copy(w, resp.Body)
 
 				return
@@ -168,7 +172,7 @@ func proxyHandler(pool *BackendPool) http.HandlerFunc {
 			// Backend failed
 			pool.MarkUnhealthy(backend.URL)
 
-			// Don't retry non-idempotent requests
+			// Don't retry unsafe methods
 			if !isRetryable(r.Method) {
 				http.Error(w, "Backend unavailable", http.StatusBadGateway)
 				return
