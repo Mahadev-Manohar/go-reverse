@@ -57,6 +57,7 @@ func createProxyRequest(r *http.Request, backend Backend, body []byte) (*http.Re
 
 func proxyHandler(pool *BackendPool, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
 
 		body, err := io.ReadAll(r.Body)
 
@@ -107,6 +108,7 @@ func proxyHandler(pool *BackendPool, logger *slog.Logger) http.HandlerFunc {
 					"path", r.URL.Path,
 					"backend", backend.Name,
 					"status", resp.StatusCode,
+					"duration", time.Since(start),
 				)
 
 				return
