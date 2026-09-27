@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"sync"
 	"time"
+	"log/slog"
 )
 
 
@@ -54,7 +55,7 @@ func createProxyRequest(r *http.Request, backend Backend, body []byte) (*http.Re
 	return req, nil
 }
 
-func proxyHandler(pool *BackendPool) http.HandlerFunc {
+func proxyHandler(pool *BackendPool, logger *slog.Logger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 
 		body, err := io.ReadAll(r.Body)
@@ -98,14 +99,28 @@ func proxyHandler(pool *BackendPool) http.HandlerFunc {
 				}
 
 				w.WriteHeader(resp.StatusCode)
-
 				io.Copy(w, resp.Body)
+
+				logger.Info(
+					"request completed",
+					"method", r.Method,
+					"path", r.URL.Path,
+					"backend", backend.Name,
+					"status", resp.StatusCode,
+				)
 
 				return
 			}
 
 			// Backend failed
 			pool.MarkUnhealthy(backend.URL)
+
+			logger.Error(
+				"backend request failed",
+				"backend", backend.Name,
+				"url", backend.URL,
+				"error", err,
+			)
 
 			// Don't retry unsafe methods
 			if !isRetryable(r.Method) {
@@ -197,6 +212,9 @@ func (p *BackendPool) Size() int {
 
 func main() {
 
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	logger.Info("proxy starting", "address", ":8080")
+
 	appCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -225,7 +243,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:    ":8080",
-		Handler: proxyHandler(pool),
+		Handler: proxyHandler(pool, logger),
 	}
 
 	fmt.Println("Proxy running on :8080")
