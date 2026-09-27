@@ -13,7 +13,14 @@ func main() {
 	flag.Parse()
 
 	http.HandleFunc("/hello", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "Hello from %s\n", *name)
+		requestID := r.Header.Get("X-Request-ID")
+
+		fmt.Fprintf(
+			w,
+			"Hello from %s\nRequest ID: %s\n",
+			*name,
+			requestID,
+		)
 	})
 
 	fmt.Printf("%s running on :%s\n", *name, *port)

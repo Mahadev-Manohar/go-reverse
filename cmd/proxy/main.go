@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 	"log/slog"
+	"crypto/rand"
 )
 
 
@@ -28,6 +29,25 @@ type BackendPool struct {
 	mu	   sync.Mutex
 }
 
+type Metrics struct {
+	mu                sync.Mutex
+	totalRequests     int
+	successfulRequests int
+	failedRequests    int
+	backendRequests   map[string]int
+}
+
+
+func generateRequestID() string {
+	b := make([]byte, 16)
+
+	_, err := rand.Read(b)
+	if err != nil {
+		return "unknown"
+	}
+
+	return fmt.Sprintf("%x", b)
+}
 
 func isRetryable(method string) bool {
 	return method == http.MethodGet ||
@@ -35,7 +55,7 @@ func isRetryable(method string) bool {
 		method == http.MethodOptions
 }
 
-func createProxyRequest(r *http.Request, backend Backend, body []byte) (*http.Request, error) {
+func createProxyRequest(r *http.Request, backend Backend, body []byte, requestID string,) (*http.Request, error) {
 	req, err := http.NewRequest(
 		r.Method,
 		backend.URL+r.URL.RequestURI(),
@@ -51,13 +71,19 @@ func createProxyRequest(r *http.Request, backend Backend, body []byte) (*http.Re
 			req.Header.Add(key, value)
 		}
 	}
+	req.Header.Set("X-Request-ID", requestID)
 
 	return req, nil
 }
 
-func proxyHandler(pool *BackendPool, logger *slog.Logger) http.HandlerFunc {
+func proxyHandler(pool *BackendPool, logger *slog.Logger, metrics *Metrics,) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		requestID := generateRequestID()
 		start := time.Now()
+
+		metrics.mu.Lock()
+		metrics.totalRequests++
+		metrics.mu.Unlock()
 
 		body, err := io.ReadAll(r.Body)
 
@@ -77,11 +103,14 @@ func proxyHandler(pool *BackendPool, logger *slog.Logger) http.HandlerFunc {
 			backend, err := pool.Next()
 
 			if err != nil {
+				metrics.mu.Lock()
+				metrics.failedRequests++
+				metrics.mu.Unlock()
 				http.Error(w, "No healthy backends available", http.StatusServiceUnavailable)
 				return
 			}
 
-			req, err := createProxyRequest(r, backend, body)
+			req, err := createProxyRequest(r, backend, body, requestID)
 
 			if err != nil {
 				http.Error(w, "Failed to create request", http.StatusInternalServerError)
@@ -102,13 +131,19 @@ func proxyHandler(pool *BackendPool, logger *slog.Logger) http.HandlerFunc {
 				w.WriteHeader(resp.StatusCode)
 				io.Copy(w, resp.Body)
 
+				metrics.mu.Lock()
+				metrics.successfulRequests++
+				metrics.backendRequests[backend.Name]++
+				metrics.mu.Unlock()
+
 				logger.Info(
 					"request completed",
+					"request_id", requestID,
 					"method", r.Method,
 					"path", r.URL.Path,
 					"backend", backend.Name,
 					"status", resp.StatusCode,
-					"duration", time.Since(start),
+					"duration", time.Since(start).String(),
 				)
 
 				return
@@ -119,6 +154,7 @@ func proxyHandler(pool *BackendPool, logger *slog.Logger) http.HandlerFunc {
 
 			logger.Error(
 				"backend request failed",
+				"request_id", requestID,
 				"backend", backend.Name,
 				"url", backend.URL,
 				"error", err,
@@ -131,6 +167,9 @@ func proxyHandler(pool *BackendPool, logger *slog.Logger) http.HandlerFunc {
 			}
 		}
 
+		metrics.mu.Lock()
+		metrics.failedRequests++
+		metrics.mu.Unlock()
 		http.Error(w, "Backend unavailable", http.StatusBadGateway)
 	}
 }
@@ -214,12 +253,15 @@ func (p *BackendPool) Size() int {
 
 func main() {
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	logger.Info("proxy starting", "address", ":8080")
 
 	appCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	metrics := &Metrics{
+		backendRequests: make(map[string]int),
+	}
 
 	pool := &BackendPool{
 		backends: []Backend{
@@ -245,7 +287,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:    ":8080",
-		Handler: proxyHandler(pool, logger),
+		Handler: proxyHandler(pool, logger, metrics),
 	}
 
 	fmt.Println("Proxy running on :8080")
