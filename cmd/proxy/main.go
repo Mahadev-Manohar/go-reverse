@@ -3,12 +3,15 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"os/signal"
 	"sync"
 	"time"
-	"errors"
 )
 
 
@@ -49,74 +52,6 @@ func createProxyRequest(r *http.Request, backend Backend, body []byte) (*http.Re
 	}
 
 	return req, nil
-}
-
-func (p *BackendPool) MarkUnhealthy(url string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	for i := range p.backends {
-		if p.backends[i].URL == url {
-			p.backends[i].Healthy = false
-			return
-		}
-	}
-}
-
-func (p *BackendPool) Next() (Backend, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	for i := 0; i < len(p.backends); i++ {
-		backend := p.backends[p.current]
-
-		p.current = (p.current + 1) % len(p.backends)
-
-		if backend.Healthy {
-			return backend, nil
-		}
-	}
-
-	return Backend{}, errors.New("no healthy backends available")
-}
-
-func (p *BackendPool) HealthCheck() {
-	client := &http.Client{
-		Timeout: 2 * time.Second,
-	}
-
-	for i := range p.backends {
-		url := p.backends[i].URL + "/hello"
-
-		resp, err := client.Get(url)
-
-		healthy := false
-
-		if err == nil {
-			healthy = resp.StatusCode >= 200 && resp.StatusCode < 300
-			resp.Body.Close()
-		}
-
-		p.mu.Lock()
-		p.backends[i].Healthy = healthy
-		p.mu.Unlock()
-	}
-}
-
-func (p *BackendPool) StartHealthChecker() {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		p.HealthCheck()
-	}
-}
-
-func (p *BackendPool) Size() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	return len(p.backends)
 }
 
 func proxyHandler(pool *BackendPool) http.HandlerFunc {
@@ -183,31 +118,143 @@ func proxyHandler(pool *BackendPool) http.HandlerFunc {
 	}
 }
 
+
+func (p *BackendPool) MarkUnhealthy(url string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for i := range p.backends {
+		if p.backends[i].URL == url {
+			p.backends[i].Healthy = false
+			return
+		}
+	}
+}
+
+func (p *BackendPool) Next() (Backend, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for i := 0; i < len(p.backends); i++ {
+		backend := p.backends[p.current]
+
+		p.current = (p.current + 1) % len(p.backends)
+
+		if backend.Healthy {
+			return backend, nil
+		}
+	}
+
+	return Backend{}, errors.New("no healthy backends available")
+}
+
+func (p *BackendPool) HealthCheck() {
+	client := &http.Client{
+		Timeout: 2 * time.Second,
+	}
+
+	for i := range p.backends {
+		url := p.backends[i].URL + "/hello"
+
+		resp, err := client.Get(url)
+
+		healthy := false
+
+		if err == nil {
+			healthy = resp.StatusCode >= 200 && resp.StatusCode < 300
+			resp.Body.Close()
+		}
+
+		p.mu.Lock()
+		p.backends[i].Healthy = healthy
+		p.mu.Unlock()
+	}
+}
+
+func (p *BackendPool) StartHealthChecker(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			p.HealthCheck()
+
+		case <-ctx.Done():
+			fmt.Println("Health checker stopped")
+			return
+		}
+	}
+}
+
+func (p *BackendPool) Size() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	return len(p.backends)
+}
+
+
 func main() {
+
+	appCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 
 	pool := &BackendPool{
 		backends: []Backend{
 			{
-				URL:  "http://localhost:9001",
-				Name: "backend-1",
+				URL:     "http://localhost:9001",
+				Name:    "backend-1",
 				Healthy: true,
 			},
 			{
-				URL:  "http://localhost:9002",
-				Name: "backend-2",
-				Healthy: true,	
+				URL:     "http://localhost:9002",
+				Name:    "backend-2",
+				Healthy: true,
 			},
 			{
-				URL:  "http://localhost:9003",
-				Name: "backend-3",
+				URL:     "http://localhost:9003",
+				Name:    "backend-3",
 				Healthy: true,
 			},
 		},
 	}
 
-	go pool.StartHealthChecker()
+	go pool.StartHealthChecker(appCtx)
 
-	http.HandleFunc("/", proxyHandler(pool))
+	server := &http.Server{
+		Addr:    ":8080",
+		Handler: proxyHandler(pool),
+	}
+
 	fmt.Println("Proxy running on :8080")
-	http.ListenAndServe(":8080", nil)
+
+	go func() {
+		if err := server.ListenAndServe(); err != nil &&
+			err != http.ErrServerClosed {
+			fmt.Println("Server error:", err)
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt)
+
+	<-stop
+
+	fmt.Println("\nShutting down proxy...")
+
+	cancel()
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(
+		context.Background(),
+		5*time.Second,
+	)
+	defer shutdownCancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		fmt.Println("Shutdown error:", err)
+	}
+
+	fmt.Println("Proxy stopped")
 }
