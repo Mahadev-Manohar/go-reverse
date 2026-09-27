@@ -38,6 +38,29 @@ type Metrics struct {
 }
 
 
+
+func (m *Metrics) RequestStarted() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.totalRequests++
+}
+
+func (m *Metrics) RequestSucceeded(backend string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.successfulRequests++
+	m.backendRequests[backend]++
+}
+
+func (m *Metrics) RequestFailed() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.failedRequests++
+}
+
 func generateRequestID() string {
 	b := make([]byte, 16)
 
@@ -81,9 +104,7 @@ func proxyHandler(pool *BackendPool, logger *slog.Logger, metrics *Metrics,) htt
 		requestID := generateRequestID()
 		start := time.Now()
 
-		metrics.mu.Lock()
-		metrics.totalRequests++
-		metrics.mu.Unlock()
+		metrics.RequestStarted()
 
 		body, err := io.ReadAll(r.Body)
 
@@ -103,9 +124,7 @@ func proxyHandler(pool *BackendPool, logger *slog.Logger, metrics *Metrics,) htt
 			backend, err := pool.Next()
 
 			if err != nil {
-				metrics.mu.Lock()
-				metrics.failedRequests++
-				metrics.mu.Unlock()
+				metrics.RequestFailed()
 				http.Error(w, "No healthy backends available", http.StatusServiceUnavailable)
 				return
 			}
@@ -131,10 +150,7 @@ func proxyHandler(pool *BackendPool, logger *slog.Logger, metrics *Metrics,) htt
 				w.WriteHeader(resp.StatusCode)
 				io.Copy(w, resp.Body)
 
-				metrics.mu.Lock()
-				metrics.successfulRequests++
-				metrics.backendRequests[backend.Name]++
-				metrics.mu.Unlock()
+				metrics.RequestSucceeded(backend.Name)
 
 				logger.Info(
 					"request completed",
@@ -167,12 +183,33 @@ func proxyHandler(pool *BackendPool, logger *slog.Logger, metrics *Metrics,) htt
 			}
 		}
 
-		metrics.mu.Lock()
-		metrics.failedRequests++
-		metrics.mu.Unlock()
+		metrics.RequestFailed()
+
 		http.Error(w, "Backend unavailable", http.StatusBadGateway)
 	}
 }
+
+func metricsHandler(metrics *Metrics) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		metrics.mu.Lock()
+		defer metrics.mu.Unlock()
+
+		fmt.Fprintf(w, "total_requests %d\n", metrics.totalRequests)
+		fmt.Fprintf(w, "successful_requests %d\n", metrics.successfulRequests)
+		fmt.Fprintf(w, "failed_requests %d\n", metrics.failedRequests)
+
+		for backend, count := range metrics.backendRequests {
+			fmt.Fprintf(
+				w,
+				"backend_requests{backend=\"%s\"} %d\n",
+				backend,
+				count,
+			)
+		}
+	}
+}
+
 
 
 func (p *BackendPool) MarkUnhealthy(url string) {
@@ -251,11 +288,13 @@ func (p *BackendPool) Size() int {
 }
 
 
+
 func main() {
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	logger.Info("proxy starting", "address", ":8080")
 
+	// Create a context that can be canceled to stop the health checker
 	appCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -283,11 +322,17 @@ func main() {
 		},
 	}
 
+	// Start the health checker in a separate goroutine
 	go pool.StartHealthChecker(appCtx)
+
+	// Create a new ServeMux and register handlers
+	mux := http.NewServeMux()
+	mux.HandleFunc("/metrics", metricsHandler(metrics))
+	mux.HandleFunc("/", proxyHandler(pool, logger, metrics))
 
 	server := &http.Server{
 		Addr:    ":8080",
-		Handler: proxyHandler(pool, logger, metrics),
+		Handler: mux,
 	}
 
 	fmt.Println("Proxy running on :8080")
@@ -299,6 +344,7 @@ func main() {
 		}
 	}()
 
+	// Wait for an interrupt signal to gracefully shut down the server
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt)
 
