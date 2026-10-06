@@ -30,11 +30,13 @@ type BackendPool struct {
 }
 
 type Metrics struct {
-	mu                sync.Mutex
-	totalRequests     int
-	successfulRequests int
-	failedRequests    int
-	backendRequests   map[string]int
+	mu                  sync.Mutex
+	totalRequests       int
+	successfulRequests  int
+	failedRequests      int
+	retriesTotal        int
+	backendRequests     map[string]int
+	backendFailures     map[string]int
 }
 
 
@@ -59,6 +61,20 @@ func (m *Metrics) RequestFailed() {
 	defer m.mu.Unlock()
 
 	m.failedRequests++
+}
+
+func (m *Metrics) BackendFailed(backend string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.backendFailures[backend]++
+}
+
+func (m *Metrics) Retry() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.retriesTotal++
 }
 
 func generateRequestID() string {
@@ -99,8 +115,9 @@ func createProxyRequest(r *http.Request, backend Backend, body []byte, requestID
 	return req, nil
 }
 
-func proxyHandler(pool *BackendPool, logger *slog.Logger, metrics *Metrics,) http.HandlerFunc {
+func proxyHandler(pool *BackendPool, logger *slog.Logger, metrics *Metrics) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+
 		requestID := generateRequestID()
 		start := time.Now()
 
@@ -117,28 +134,52 @@ func proxyHandler(pool *BackendPool, logger *slog.Logger, metrics *Metrics,) htt
 			Timeout: 5 * time.Second,
 		}
 
-		maxAttempts := pool.Size()
+		attempted := make(map[string]bool)
 
-		for attempt := 0; attempt < maxAttempts; attempt++ {
+		for {
 
-			backend, err := pool.Next()
+			// Select the next healthy backend
+			backend, err := pool.Next(attempted)
 
 			if err != nil {
 				metrics.RequestFailed()
-				http.Error(w, "No healthy backends available", http.StatusServiceUnavailable)
+
+				http.Error(
+					w,
+					"No healthy backends available",
+					http.StatusServiceUnavailable,
+				)
 				return
 			}
 
-			req, err := createProxyRequest(r, backend, body, requestID)
+			attempted[backend.URL] = true
+
+			req, err := createProxyRequest(
+				r,
+				backend,
+				body,
+				requestID,
+			)
 
 			if err != nil {
-				http.Error(w, "Failed to create request", http.StatusInternalServerError)
+				metrics.RequestFailed()
+
+				http.Error(
+					w,
+					"Failed to create request",
+					http.StatusInternalServerError,
+				)
 				return
 			}
 
 			resp, err := client.Do(req)
 
+			// --------------------------------
+			// SUCCESS
+			// --------------------------------
+
 			if err == nil {
+
 				defer resp.Body.Close()
 
 				for key, values := range resp.Header {
@@ -148,6 +189,7 @@ func proxyHandler(pool *BackendPool, logger *slog.Logger, metrics *Metrics,) htt
 				}
 
 				w.WriteHeader(resp.StatusCode)
+
 				io.Copy(w, resp.Body)
 
 				metrics.RequestSucceeded(backend.Name)
@@ -165,7 +207,11 @@ func proxyHandler(pool *BackendPool, logger *slog.Logger, metrics *Metrics,) htt
 				return
 			}
 
-			// Backend failed
+			// --------------------------------
+			// BACKEND FAILURE
+			// --------------------------------
+
+			metrics.BackendFailed(backend.Name)
 			pool.MarkUnhealthy(backend.URL)
 
 			logger.Error(
@@ -178,14 +224,23 @@ func proxyHandler(pool *BackendPool, logger *slog.Logger, metrics *Metrics,) htt
 
 			// Don't retry unsafe methods
 			if !isRetryable(r.Method) {
-				http.Error(w, "Backend unavailable", http.StatusBadGateway)
+
+				metrics.RequestFailed()
+
+				http.Error(
+					w,
+					"Backend unavailable",
+					http.StatusBadGateway,
+				)
+
 				return
 			}
+
+			// Record the retry
+			metrics.Retry()
+
+			// Loop continues and Next() selects another backend
 		}
-
-		metrics.RequestFailed()
-
-		http.Error(w, "Backend unavailable", http.StatusBadGateway)
 	}
 }
 
@@ -207,6 +262,17 @@ func metricsHandler(metrics *Metrics) http.HandlerFunc {
 				count,
 			)
 		}
+
+		fmt.Fprintf(w, "retries_total %d\n", metrics.retriesTotal)
+
+		for backend, count := range metrics.backendFailures {
+			fmt.Fprintf(
+				w,
+				"backend_failures{backend=\"%s\"} %d\n",
+				backend,
+				count,
+			)
+		}
 	}
 }
 
@@ -224,21 +290,28 @@ func (p *BackendPool) MarkUnhealthy(url string) {
 	}
 }
 
-func (p *BackendPool) Next() (Backend, error) {
+func (p *BackendPool) Next(attempted map[string]bool) (Backend, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	for i := 0; i < len(p.backends); i++ {
+
 		backend := p.backends[p.current]
 
 		p.current = (p.current + 1) % len(p.backends)
 
-		if backend.Healthy {
-			return backend, nil
+		if !backend.Healthy {
+			continue
 		}
+
+		if attempted[backend.URL] {
+			continue
+		}
+
+		return backend, nil
 	}
 
-	return Backend{}, errors.New("no healthy backends available")
+	return Backend{}, errors.New("no untried healthy backends available")
 }
 
 func (p *BackendPool) HealthCheck() {
@@ -300,6 +373,7 @@ func main() {
 
 	metrics := &Metrics{
 		backendRequests: make(map[string]int),
+		backendFailures: make(map[string]int),
 	}
 
 	pool := &BackendPool{
