@@ -1,0 +1,16 @@
+
+server:
+  port: 8080
+
+backends:
+  - name: backend-1
+    url: http://localhost:9001
+  - name: backend-2
+    url: http://localhost:9002
+  - name: backend-3
+    url: http://localhost:9003
+
+rate_limit:
+  enabled: true
+  requests_per_second: 5
+  burst: 10

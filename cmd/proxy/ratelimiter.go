@@ -7,6 +7,8 @@ import (
 	"sync"
 	"time"
 	"context"
+	"math"
+	"strconv"
 )
 
 type ClientBucket struct {
@@ -30,7 +32,8 @@ func NewRateLimiter(rate, capacity float64) *RateLimiter {
 	}
 }
 
-func (rl *RateLimiter) Allow(ip string) bool {
+
+func (rl *RateLimiter) Allow(ip string) (bool, time.Duration) {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
@@ -49,6 +52,7 @@ func (rl *RateLimiter) Allow(ip string) bool {
 
 	bucket.lastSeen = now
 
+	// Refill tokens based on elapsed time.
 	elapsed := now.Sub(bucket.lastRefill).Seconds()
 	bucket.tokens += elapsed * rl.rate
 
@@ -58,13 +62,19 @@ func (rl *RateLimiter) Allow(ip string) bool {
 
 	bucket.lastRefill = now
 
+	// Reject if fewer than one token is available.
 	if bucket.tokens < 1 {
-		return false
+		missingTokens := 1 - bucket.tokens
+		waitSeconds := missingTokens / rl.rate
+
+		return false, time.Duration(waitSeconds * float64(time.Second))
 	}
 
 	bucket.tokens--
-	return true
+
+	return true, 0
 }
+
 
 func clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -74,12 +84,26 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
+
 func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ip := clientIP(r)
 
-		if !rl.Allow(ip) {
-			w.Header().Set("Retry-After", "1")
+		allowed, wait := rl.Allow(ip)
+
+		if !allowed {
+			// Retry-After requires whole seconds.
+			retrySeconds := int(math.Ceil(wait.Seconds()))
+
+			if retrySeconds < 1 {
+				retrySeconds = 1
+			}
+
+			w.Header().Set(
+				"Retry-After",
+				strconv.Itoa(retrySeconds),
+			)
+
 			http.Error(
 				w,
 				"Rate limit exceeded",
@@ -91,6 +115,7 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
+
 
 func (rl *RateLimiter) CleanupInactiveClients(ctx context.Context, idleTimeout time.Duration, cleanupInterval time.Duration) {
 	ticker := time.NewTicker(cleanupInterval)
