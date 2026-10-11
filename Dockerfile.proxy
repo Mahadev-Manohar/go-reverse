@@ -1,0 +1,25 @@
+
+FROM golang:1.27.1-alpine AS builder
+
+WORKDIR /app
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY cmd/proxy ./cmd/proxy
+
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -o /goreverse ./cmd/proxy
+
+FROM alpine:3.22
+
+RUN apk --no-cache add ca-certificates
+
+WORKDIR /app
+
+COPY --from=builder /goreverse /goreverse
+COPY config.yaml /app/config.yaml
+
+EXPOSE 8080
+
+ENTRYPOINT ["/goreverse"]
