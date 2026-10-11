@@ -37,6 +37,11 @@ type Metrics struct {
 	retriesTotal        int
 	backendRequests     map[string]int
 	backendFailures     map[string]int
+
+	requestDurationSum    float64
+	requestDurationBuckets map[float64]int
+	healthChecksTotal    map[string]int
+	healthCheckFailures  map[string]int
 }
 
 
@@ -76,6 +81,18 @@ func (m *Metrics) Retry() {
 
 	m.retriesTotal++
 }
+
+func (m *Metrics) HealthCheck(backend string, healthy bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.healthChecksTotal[backend]++
+
+	if !healthy {
+		m.healthCheckFailures[backend]++
+	}
+}
+
 
 func generateRequestID() string {
 	b := make([]byte, 16)
@@ -193,6 +210,7 @@ func proxyHandler(pool *BackendPool, logger *slog.Logger, metrics *Metrics) http
 				io.Copy(w, resp.Body)
 
 				metrics.RequestSucceeded(backend.Name)
+				metrics.ObserveRequestDuration(time.Since(start))
 
 				logger.Info(
 					"request completed",
@@ -244,38 +262,152 @@ func proxyHandler(pool *BackendPool, logger *slog.Logger, metrics *Metrics) http
 	}
 }
 
-func metricsHandler(metrics *Metrics) http.HandlerFunc {
+func metricsHandler(metrics *Metrics, pool *BackendPool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 
 		metrics.mu.Lock()
 		defer metrics.mu.Unlock()
 
-		fmt.Fprintf(w, "total_requests %d\n", metrics.totalRequests)
-		fmt.Fprintf(w, "successful_requests %d\n", metrics.successfulRequests)
-		fmt.Fprintf(w, "failed_requests %d\n", metrics.failedRequests)
+		fmt.Fprintln(w, "# HELP goreverse_requests_total Total number of requests")
+		fmt.Fprintln(w, "# TYPE goreverse_requests_total counter")
+		fmt.Fprintf(w, "goreverse_requests_total %d\n\n", metrics.totalRequests)
+
+		fmt.Fprintln(w, "# HELP goreverse_requests_success_total Total number of successful requests")
+		fmt.Fprintln(w, "# TYPE goreverse_requests_success_total counter")
+		fmt.Fprintf(w, "goreverse_requests_success_total %d\n\n", metrics.successfulRequests)
+
+		fmt.Fprintln(w, "# HELP goreverse_requests_failed_total Total number of failed requests")
+		fmt.Fprintln(w, "# TYPE goreverse_requests_failed_total counter")
+		fmt.Fprintf(w, "goreverse_requests_failed_total %d\n\n", metrics.failedRequests)
+
+		fmt.Fprintln(w, "# HELP goreverse_retries_total Total number of retries")
+		fmt.Fprintln(w, "# TYPE goreverse_retries_total counter")
+		fmt.Fprintf(w, "goreverse_retries_total %d\n\n", metrics.retriesTotal)
+
+		fmt.Fprintln(w, "# HELP goreverse_backend_requests_total Requests handled by each backend")
+		fmt.Fprintln(w, "# TYPE goreverse_backend_requests_total counter")
 
 		for backend, count := range metrics.backendRequests {
 			fmt.Fprintf(
 				w,
-				"backend_requests{backend=\"%s\"} %d\n",
+				"goreverse_backend_requests_total{backend=\"%s\"} %d\n",
 				backend,
 				count,
 			)
 		}
 
-		fmt.Fprintf(w, "retries_total %d\n", metrics.retriesTotal)
+		fmt.Fprintln(w)
+
+		fmt.Fprintln(w, "# HELP goreverse_backend_failures_total Backend request failures")
+		fmt.Fprintln(w, "# TYPE goreverse_backend_failures_total counter")
 
 		for backend, count := range metrics.backendFailures {
 			fmt.Fprintf(
 				w,
-				"backend_failures{backend=\"%s\"} %d\n",
+				"goreverse_backend_failures_total{backend=\"%s\"} %d\n",
+				backend,
+				count,
+			)
+		}
+
+		fmt.Fprintln(w)
+
+		fmt.Fprintln(w, "# HELP goreverse_backend_healthy Backend health status (1 = healthy, 0 = unhealthy)")
+		fmt.Fprintln(w, "# TYPE goreverse_backend_healthy gauge")
+
+		pool.mu.Lock()
+		defer pool.mu.Unlock()
+
+		for _, backend := range pool.backends {
+
+			healthy := 0
+
+			if backend.Healthy {
+				healthy = 1
+			}
+
+			fmt.Fprintf(
+				w,
+				"goreverse_backend_healthy{backend=\"%s\"} %d\n",
+				backend.Name,
+				healthy,
+			)
+		}
+
+		fmt.Fprintln(w)
+
+		fmt.Fprintln(w, "# HELP goreverse_request_duration_seconds Request duration in seconds")
+		fmt.Fprintln(w, "# TYPE goreverse_request_duration_seconds histogram")
+
+		buckets := []float64{
+			0.001,
+			0.005,
+			0.01,
+			0.05,
+			0.1,
+			0.5,
+			1.0,
+			5.0,
+		}
+
+		for _, bucket := range buckets {
+			count := metrics.requestDurationBuckets[bucket]
+
+			fmt.Fprintf(
+				w,
+				"goreverse_request_duration_seconds_bucket{le=\"%g\"} %d\n",
+				bucket,
+				count,
+			)
+		}
+
+		fmt.Fprintf(
+			w,
+			"goreverse_request_duration_seconds_bucket{le=\"+Inf\"} %d\n",
+			metrics.totalRequests,
+		)
+
+		fmt.Fprintf(
+			w,
+			"goreverse_request_duration_seconds_sum %f\n",
+			metrics.requestDurationSum,
+		)
+
+		fmt.Fprintf(
+			w,
+			"goreverse_request_duration_seconds_count %d\n",
+			metrics.totalRequests,
+		)
+
+		fmt.Fprintln(w)
+
+		fmt.Fprintln(w, "# HELP goreverse_health_checks_total Total health checks performed")
+		fmt.Fprintln(w, "# TYPE goreverse_health_checks_total counter")
+
+		for backend, count := range metrics.healthChecksTotal {
+			fmt.Fprintf(
+				w,
+				"goreverse_health_checks_total{backend=\"%s\"} %d\n",
+				backend,
+				count,
+			)
+		}
+
+		fmt.Fprintln(w)
+
+		fmt.Fprintln(w, "# HELP goreverse_health_check_failures_total Failed health checks")
+		fmt.Fprintln(w, "# TYPE goreverse_health_check_failures_total counter")
+
+		for backend, count := range metrics.healthCheckFailures {
+			fmt.Fprintf(
+				w,
+				"goreverse_health_check_failures_total{backend=\"%s\"} %d\n",
 				backend,
 				count,
 			)
 		}
 	}
 }
-
 
 
 func (p *BackendPool) MarkUnhealthy(url string) {
@@ -314,13 +446,23 @@ func (p *BackendPool) Next(attempted map[string]bool) (Backend, error) {
 	return Backend{}, errors.New("no untried healthy backends available")
 }
 
-func (p *BackendPool) HealthCheck() {
+func (p *BackendPool) HealthCheck(metrics *Metrics) {
 	client := &http.Client{
 		Timeout: 2 * time.Second,
 	}
 
-	for i := range p.backends {
-		url := p.backends[i].URL + "/hello"
+	// Take a snapshot of the backends.
+	p.mu.Lock()
+
+	backends := make([]Backend, len(p.backends))
+	copy(backends, p.backends)
+
+	p.mu.Unlock()
+
+	// Perform network requests WITHOUT holding the mutex.
+	for _, backend := range backends {
+
+		url := backend.URL + "/hello"
 
 		resp, err := client.Get(url)
 
@@ -331,20 +473,30 @@ func (p *BackendPool) HealthCheck() {
 			resp.Body.Close()
 		}
 
+		metrics.HealthCheck(backend.Name, healthy)
+
+		// Update health state safely.
 		p.mu.Lock()
-		p.backends[i].Healthy = healthy
+
+		for i := range p.backends {
+			if p.backends[i].URL == backend.URL {
+				p.backends[i].Healthy = healthy
+				break
+			}
+		}
+
 		p.mu.Unlock()
 	}
 }
 
-func (p *BackendPool) StartHealthChecker(ctx context.Context) {
+func (p *BackendPool) StartHealthChecker(ctx context.Context, metrics *Metrics, ) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			p.HealthCheck()
+			p.HealthCheck(metrics)
 
 		case <-ctx.Done():
 			fmt.Println("Health checker stopped")
@@ -360,6 +512,31 @@ func (p *BackendPool) Size() int {
 	return len(p.backends)
 }
 
+func (m *Metrics) ObserveRequestDuration(duration time.Duration) {
+    seconds := duration.Seconds()
+
+    m.mu.Lock()
+    defer m.mu.Unlock()
+
+    m.requestDurationSum += seconds
+
+    buckets := []float64{
+        0.001,
+        0.005,
+        0.01,
+        0.05,
+        0.1,
+        0.5,
+        1.0,
+        5.0,
+    }
+
+    for _, bucket := range buckets {
+        if seconds <= bucket {
+            m.requestDurationBuckets[bucket]++
+        }
+    }
+}
 
 
 func main() {
@@ -372,9 +549,19 @@ func main() {
 	defer cancel()
 
 	metrics := &Metrics{
-		backendRequests: make(map[string]int),
-		backendFailures: make(map[string]int),
+		backendRequests:        make(map[string]int),
+		backendFailures:        make(map[string]int),
+		requestDurationBuckets: make(map[float64]int),
+		healthChecksTotal:      make(map[string]int),
+		healthCheckFailures:    make(map[string]int),
 	}
+
+	rateLimiter := NewRateLimiter(5, 10)
+	go rateLimiter.CleanupInactiveClients(
+		appCtx,
+		10*time.Minute,
+		1*time.Minute,
+	)
 
 	pool := &BackendPool{
 		backends: []Backend{
@@ -397,12 +584,14 @@ func main() {
 	}
 
 	// Start the health checker in a separate goroutine
-	go pool.StartHealthChecker(appCtx)
+	go pool.StartHealthChecker(appCtx, metrics)
 
 	// Create a new ServeMux and register handlers
 	mux := http.NewServeMux()
-	mux.HandleFunc("/metrics", metricsHandler(metrics))
-	mux.HandleFunc("/", proxyHandler(pool, logger, metrics))
+
+	mux.HandleFunc("/metrics", metricsHandler(metrics, pool))
+	proxyHandlerFunc := proxyHandler(pool, logger, metrics)
+	mux.Handle("/", rateLimiter.Middleware(proxyHandlerFunc))
 
 	server := &http.Server{
 		Addr:    ":8080",
