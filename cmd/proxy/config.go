@@ -5,9 +5,14 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"bytes"
+	"math"
+	"net/url"
+	"strconv"
 
 	"gopkg.in/yaml.v3"
 )
+
 
 type Config struct {
 	Server struct {
@@ -28,6 +33,7 @@ type BackendConfig struct {
 	URL  string `yaml:"url"`
 }
 
+
 func LoadConfig(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -36,8 +42,48 @@ func LoadConfig(path string) (*Config, error) {
 
 	var config Config
 
-	if err := yaml.Unmarshal(data, &config); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+
+	if err := decoder.Decode(&config); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
+	}
+
+	// Environment variables override YAML values.
+	if value, ok := os.LookupEnv("GOREVERSE_PORT"); ok {
+		port, err := strconv.Atoi(value)
+		if err != nil {
+			return nil, fmt.Errorf("invalid GOREVERSE_PORT: %w", err)
+		}
+		config.Server.Port = port
+	}
+
+	if value, ok := os.LookupEnv("GOREVERSE_RATE_LIMIT_ENABLED"); ok {
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"invalid GOREVERSE_RATE_LIMIT_ENABLED: %w", err,
+			)
+		}
+		config.RateLimit.Enabled = enabled
+	}
+
+	if value, ok := os.LookupEnv("GOREVERSE_RATE_LIMIT_RPS"); ok {
+		rate, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid GOREVERSE_RATE_LIMIT_RPS: %w", err)
+		}
+		config.RateLimit.RequestsPerSecond = rate
+	}
+
+	if value, ok := os.LookupEnv("GOREVERSE_RATE_LIMIT_BURST"); ok {
+		burst, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"invalid GOREVERSE_RATE_LIMIT_BURST: %w", err,
+			)
+		}
+		config.RateLimit.Burst = burst
 	}
 
 	if err := config.Validate(); err != nil {
@@ -46,6 +92,7 @@ func LoadConfig(path string) (*Config, error) {
 
 	return &config, nil
 }
+
 
 func (c *Config) Validate() error {
 	if c.Server.Port < 1 || c.Server.Port > 65535 {
@@ -60,40 +107,43 @@ func (c *Config) Validate() error {
 	seenURLs := make(map[string]bool)
 
 	for _, backend := range c.Backends {
-		if strings.TrimSpace(backend.Name) == "" {
+		name := strings.TrimSpace(backend.Name)
+		if name == "" {
 			return fmt.Errorf("backend name cannot be empty")
 		}
-
-		if seenNames[backend.Name] {
-			return fmt.Errorf("duplicate backend name: %s", backend.Name)
+		if seenNames[name] {
+			return fmt.Errorf("duplicate backend name: %s", name)
 		}
-		seenNames[backend.Name] = true
+		seenNames[name] = true
 
-		if strings.TrimSpace(backend.URL) == "" {
-			return fmt.Errorf("backend URL cannot be empty: %s", backend.Name)
+		rawURL := strings.TrimSpace(backend.URL)
+		if rawURL == "" {
+			return fmt.Errorf("backend URL cannot be empty: %s", name)
 		}
 
-		if seenURLs[backend.URL] {
-			return fmt.Errorf("duplicate backend URL: %s", backend.URL)
+		parsed, err := url.ParseRequestURI(rawURL)
+		if err != nil ||
+			(parsed.Scheme != "http" && parsed.Scheme != "https") ||
+			parsed.Hostname() == "" {
+			return fmt.Errorf("invalid HTTP(S) URL for backend %s: %s", name, rawURL)
 		}
-		seenURLs[backend.URL] = true
 
-		if !strings.HasPrefix(backend.URL, "http://") &&
-			!strings.HasPrefix(backend.URL, "https://") {
-			return fmt.Errorf(
-				"backend %s must use an http:// or https:// URL",
-				backend.Name,
-			)
+		if seenURLs[rawURL] {
+			return fmt.Errorf("duplicate backend URL: %s", rawURL)
 		}
+		seenURLs[rawURL] = true
 	}
 
 	if c.RateLimit.Enabled {
-		if c.RateLimit.RequestsPerSecond <= 0 {
-			return fmt.Errorf("rate_limit.requests_per_second must be positive")
+		rate := c.RateLimit.RequestsPerSecond
+		burst := c.RateLimit.Burst
+
+		if rate <= 0 || math.IsNaN(rate) || math.IsInf(rate, 0) {
+			return fmt.Errorf("rate_limit.requests_per_second must be finite and positive")
 		}
 
-		if c.RateLimit.Burst < 1 {
-			return fmt.Errorf("rate_limit.burst must be at least 1")
+		if burst < 1 || math.IsNaN(burst) || math.IsInf(burst, 0) {
+			return fmt.Errorf("rate_limit.burst must be finite and at least 1")
 		}
 	}
 

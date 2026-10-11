@@ -541,6 +541,19 @@ func (m *Metrics) ObserveRequestDuration(duration time.Duration) {
 
 func main() {
 
+	configPath := os.Getenv("GOREVERSE_CONFIG")
+	if configPath == "" {
+		configPath = "config.yaml"
+	}
+
+	
+	config, err := LoadConfig(configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Configuration error: %v\n", err)
+		os.Exit(1)
+	}
+	// fmt.Println(config)
+
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	logger.Info("proxy starting", "address", ":8080")
 
@@ -556,31 +569,39 @@ func main() {
 		healthCheckFailures:    make(map[string]int),
 	}
 
-	rateLimiter := NewRateLimiter(5, 10)
+	var rateLimiter *RateLimiter
+
+	if config.RateLimit.Enabled {
+		rateLimiter = NewRateLimiter(
+			config.RateLimit.RequestsPerSecond,
+			config.RateLimit.Burst,
+		)
+
+		go rateLimiter.CleanupInactiveClients(
+			appCtx,
+			10*time.Minute,
+			1*time.Minute,
+		)
+	}
+
 	go rateLimiter.CleanupInactiveClients(
 		appCtx,
 		10*time.Minute,
 		1*time.Minute,
 	)
 
+	// Create backend pool from config
+	backends := make([]Backend, 0, len(config.Backends))
+	for _, backendConfig := range config.Backends {
+		backends = append(backends, Backend{
+			Name:    backendConfig.Name,
+			URL:     backendConfig.URL,
+			Healthy: true,
+		})
+	}
+
 	pool := &BackendPool{
-		backends: []Backend{
-			{
-				URL:     "http://localhost:9001",
-				Name:    "backend-1",
-				Healthy: true,
-			},
-			{
-				URL:     "http://localhost:9002",
-				Name:    "backend-2",
-				Healthy: true,
-			},
-			{
-				URL:     "http://localhost:9003",
-				Name:    "backend-3",
-				Healthy: true,
-			},
-		},
+		backends: backends,
 	}
 
 	// Start the health checker in a separate goroutine
@@ -590,11 +611,17 @@ func main() {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/metrics", metricsHandler(metrics, pool))
-	proxyHandlerFunc := proxyHandler(pool, logger, metrics)
-	mux.Handle("/", rateLimiter.Middleware(proxyHandlerFunc))
+
+	var proxyHandlerFunc http.Handler = proxyHandler(pool, logger, metrics)
+
+	if rateLimiter != nil {
+		proxyHandlerFunc = rateLimiter.Middleware(proxyHandlerFunc)
+	}
+
+	mux.Handle("/", proxyHandlerFunc)
 
 	server := &http.Server{
-		Addr:    ":8080",
+		Addr:   fmt.Sprintf(":%d", config.Server.Port),
 		Handler: mux,
 	}
 

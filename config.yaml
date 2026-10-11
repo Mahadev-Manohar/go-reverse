@@ -4,11 +4,11 @@ server:
 
 backends:
   - name: backend-1
-    url: http://localhost:9001
+    url: http://backend-1:9001
   - name: backend-2
-    url: http://localhost:9002
+    url: http://backend-2:9002
   - name: backend-3
-    url: http://localhost:9003
+    url: http://backend-3:9003
 
 rate_limit:
   enabled: true
